@@ -19,19 +19,35 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v3
 
+      # Node가 필요없는 정적 리포여도 문제 없음
       - name: Install Node.js
         uses: actions/setup-node@v3
         with:
           node-version: '18'
 
-      - name: Install dependencies
-        run: npm install
+      # package.json 있으면 설치 + build 스크립트가 있을 때만 빌드
+      - name: Build (if needed)
+        run: |
+          if [ -f package.json ]; then
+            npm ci
+            if npm run | grep -q " build"; then
+              npm run build || true
+            fi
+          fi
 
-      - name: Build project
-        run: npm run build
-
-      - name: Check build folder contents
-        run: ls -la build || echo "build 폴더가 없습니다"
+      # 배포 소스 폴더 자동 감지: build -> dist -> out -> (없으면) .
+      - name: Pick deploy dir (build/dist/out or .)
+        id: pick
+        run: |
+          for d in build dist out; do
+            if [ -d "$d" ]; then
+              echo "dir=$d" >> $GITHUB_OUTPUT
+              echo "Detected deploy dir: $d"
+              exit 0
+            fi
+          done
+          echo "dir=." >> $GITHUB_OUTPUT
+          echo "No build/dist/out found, deploying repository root (static files)."
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v3
@@ -40,17 +56,13 @@ jobs:
           aws-secret-access-key: ${{ secrets.SANDWICH_USER_AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # (선택) 추가 파일 동기화: s3://.../deploy/ -> ./additional/
       - name: Download additional files from S3
         run: |
-          ADDITIONAL_FILES=(
-            $(aws s3 ls s3://sandwich-user-projects/${{ env.USER_ID }}/${{ env.PROJECT_ID }}/deploy/ --recursive | awk '{print $4}')
-          )
           mkdir -p additional
-          for file in "${ADDITIONAL_FILES[@]}"; do
-            echo "Downloading $file..."
-            aws s3 cp s3://sandwich-user-projects/${{ env.USER_ID }}/${{ env.PROJECT_ID }}/deploy/$file additional/$file
-          done
+          aws s3 sync "s3://${{ env.S3_BUCKET }}/${{ env.USER_ID }}/${{ env.PROJECT_ID }}/deploy/" additional/ || true
 
+      # 아래 ECS/ECR 단계는 Dockerfile 있을 때만 이미지 푸시 (리포 정의/서비스 생성은 실패해도 무시)
       - name: Create ECS Cluster
         run: |
           aws ecs create-cluster --cluster-name sandwich-${{ github.repository_owner }}-${{ github.event.repository.name }} || true
@@ -70,9 +82,10 @@ jobs:
 
       - name: Create ECR repository if not exists
         run: |
-          aws ecr describe-repositories --repository-names "sandwich-user-projects/${{ env.USER_ID }}-${{ env.PROJECT_ID }}" ||           aws ecr create-repository --repository-name "sandwich-user-projects/${{ env.USER_ID }}-${{ env.PROJECT_ID }}"
+          aws ecr describe-repositories --repository-names "sandwich-user-projects/${{ env.USER_ID }}-${{ env.PROJECT_ID }}" || \
+          aws ecr create-repository --repository-name "sandwich-user-projects/${{ env.USER_ID }}-${{ env.PROJECT_ID }}"
 
-      - name: Build and Push Docker image
+      - name: Build and Push Docker image (only if Dockerfile exists)
         run: |
           if [ -f Dockerfile ]; then
             IMAGE_TAG=${GITHUB_SHA}
@@ -86,9 +99,19 @@ jobs:
             echo "No Dockerfile, skipping Docker build"
           fi
 
+      # 자동 감지한 폴더를 S3로 업로드
       - name: Deploy to S3
-        run: aws s3 sync build/ s3://${{ env.S3_BUCKET }}/${{ env.USER_ID }}/${{ env.PROJECT_ID }} --acl public-read
+        run: |
+          SRC="${{ steps.pick.outputs.dir }}"
+          if [ "$SRC" = "." ]; then
+            aws s3 sync . "s3://${{ env.S3_BUCKET }}/${{ env.USER_ID }}/${{ env.PROJECT_ID }}/" \
+              --exclude ".git/*" --exclude ".github/*" --exclude "node_modules/*"
+          else
+            aws s3 sync "$SRC/" "s3://${{ env.S3_BUCKET }}/${{ env.USER_ID }}/${{ env.PROJECT_ID }}/" --delete
+          fi
 
       - name: Invalidate CloudFront cache
         run: |
-          aws cloudfront create-invalidation           --distribution-id ${{ secrets.SANDWICH_USER_CLOUDFRONT_DISTRIBUTION_ID }}           --paths "/${{ env.USER_ID }}/${{ env.PROJECT_ID }}/*"
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.SANDWICH_USER_CLOUDFRONT_DISTRIBUTION_ID }} \
+            --paths "/${{ env.USER_ID }}/${{ env.PROJECT_ID }}/*"
